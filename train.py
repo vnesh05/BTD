@@ -1,151 +1,115 @@
-from model import EnhancedBrainTumorCNN
-import os, json
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, models, transforms
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from datetime import datetime
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import cv2
+import glob
+import random
 
-# ---------------- CONFIG ----------------
-train_dir = "data/train"
-val_dir = "data/val"
-test_dir = "data/test"
-img_size = 224
-batch_size = 32
-epochs = 10
-lr = 3e-4
-weight_decay = 1e-4
-patience = 3
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-torch.backends.cudnn.benchmark = True
-print(f"✅ Using device: {device}")
+EPOCH = 100
+BATCH_SIZE = 32
+LR = 0.0001
+PATIENCE = 15
 
-# ---------------- TRANSFORMS ----------------
-train_tf = transforms.Compose([
-    transforms.Grayscale(num_output_channels=3),
-    transforms.Resize((img_size, img_size)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomRotation(20),
-    transforms.RandomResizedCrop(img_size, scale=(0.8, 1.0)),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
+class MRI(Dataset):
+    def __init__(self, mode='train'):
+        if mode == 'train':
+            tumour_path = "data/train/tumor/*.jpg"
+            no_tumour_path = "data/train/no_tumor/*.jpg"
+        elif mode == 'val':
+            tumour_path = "data/val/tumor/*.jpg"
+            no_tumour_path = "data/val/no_tumor/*.jpg"
+        else:
+            tumour_path = "data/test/tumor/*.jpg"
+            no_tumour_path = "data/test/no_tumor/*.jpg"
 
-eval_tf = transforms.Compose([
-    transforms.Grayscale(num_output_channels=3),
-    transforms.Resize((img_size, img_size)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
-])
+        self.data = glob.glob(tumour_path) + glob.glob(no_tumour_path)
+        self.labels = [1]*len(glob.glob(tumour_path)) + [0]*len(glob.glob(no_tumour_path))
 
-# ---------------- LOAD DATA ----------------
-train_ds = datasets.ImageFolder(train_dir, transform=train_tf)
-val_ds = datasets.ImageFolder(val_dir, transform=eval_tf)
-test_ds = datasets.ImageFolder(test_dir, transform=eval_tf)
+    def __len__(self):
+        return len(self.data)
 
-train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+    def augment(self, img):
+        if random.random() > 0.5:
+            img = cv2.flip(img, 1)
+        if random.random() > 0.5:
+            angle = random.randint(-15, 15)
+            h, w = img.shape[:2]
+            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+            img = cv2.warpAffine(img, M, (w, h))
+        return img
 
-classes = train_ds.classes
-print(f"✅ Classes: {classes}")
+    def __getitem__(self, idx):
+        img_path = self.data[idx]
+        label = self.labels[idx]
+        img = cv2.imread(img_path)
+        img = cv2.resize(img, (128, 128))
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if "train" in img_path:
+            img = self.augment(img)
+        img = img / 255.0
+        img = np.transpose(img, (2, 0, 1))
+        return torch.tensor(img, dtype=torch.float32), torch.tensor(label, dtype=torch.float32).unsqueeze(0)
 
-# ---------------- MODEL ----------------
-model = EnhancedBrainTumorCNN(num_classes=len(classes))
-model = model.to(device)
+class DeeperCNN(nn.Module):
+    def __init__(self):
+        super(DeeperCNN, self).__init__()
+        self.cnn_model = nn.Sequential(
+            nn.Conv2d(3, 16, 5), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 5), nn.ReLU(), nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 5), nn.ReLU(), nn.MaxPool2d(2)
+        )
+        self.fc_model = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64*12*12, 128), nn.ReLU(), nn.Dropout(0.4),
+            nn.Linear(128, 1), nn.Sigmoid()
+        )
 
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-scaler = torch.cuda.amp.GradScaler()
+    def forward(self, x):
+        return self.fc_model(self.cnn_model(x))
 
-# ---------------- EVAL FUNCTION ----------------
-def compute_metrics(y_true, y_prob):
-    y_pred = (y_prob >= 0.5).astype(int)
-    acc = accuracy_score(y_true, y_pred)
-    prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary', zero_division=0)
-    auc = roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else 0
-    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "roc_auc": auc}
+def train_system():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    train_loader = DataLoader(MRI('train'), batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(MRI('val'), batch_size=BATCH_SIZE, shuffle=False)
+    model = DeeperCNN().to(device)
+    criterion = nn.BCELoss()
+    optimizer = optim.Adam(model.parameters(), lr=LR)
+    best_val_loss = float('inf')
+    patience_counter = 0
 
-def evaluate(model, loader, device, criterion):
-    model.eval()
-    all_probs, all_labels = [], []
-    running_loss = 0.0
-    with torch.no_grad():
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
-            logits = model(x)
-            probs = torch.softmax(logits, dim=1)[:, 1]
-            loss = criterion(logits, y)
-            running_loss += loss.item() * x.size(0)
-            all_probs.append(probs.cpu().numpy())
-            all_labels.append(y.cpu().numpy())
-    all_probs = np.concatenate(all_probs)
-    all_labels = np.concatenate(all_labels)
-    metrics = compute_metrics(all_labels, all_probs)
-    return running_loss / len(loader.dataset), metrics
+    for epoch in range(EPOCH):
+        model.train()
+        train_loss = 0
+        for X, y in train_loader:
+            X, y = X.to(device), y.to(device)
+            optimizer.zero_grad()
+            loss = criterion(model(X), y)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
 
-# ---------------- TRAIN LOOP ----------------
-out_dir = f"outputs/{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-os.makedirs(out_dir, exist_ok=True)
-best_f1, epochs_no_improve = -1, 0
-history = {"train_loss": [], "val_loss": [], "val_f1": [], "val_auc": []}
-best_path = os.path.join(out_dir, "best.pt")
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X, y in val_loader:
+                X, y = X.to(device), y.to(device)
+                val_loss += criterion(model(X), y).item()
 
-for epoch in range(1, epochs + 1):
-    model.train()
-    running_loss = 0.0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
-    for x, y in pbar:
-        x, y = x.to(device), y.to(device)
-        optimizer.zero_grad()
-        with torch.cuda.amp.autocast():
-            logits = model(x)
-            loss = criterion(logits, y)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        running_loss += loss.item() * x.size(0)
-        pbar.set_postfix(loss=loss.item())
+        avg_train = train_loss / len(train_loader)
+        avg_val = val_loss / len(val_loader)
+        print(f"Epoch {epoch+1} Train Loss: {avg_train:.4f} | Val Loss: {avg_val:.4f}")
 
-    train_loss = running_loss / len(train_loader.dataset)
-    val_loss, val_metrics = evaluate(model, val_loader, device, criterion)
-    history["train_loss"].append(train_loss)
-    history["val_loss"].append(val_loss)
-    history["val_f1"].append(val_metrics["f1"])
-    history["val_auc"].append(val_metrics["roc_auc"])
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save(model.state_dict(), "best_mri_model_v2.pth")
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-    print(f"Epoch {epoch}: train_loss={train_loss:.4f}, val_loss={val_loss:.4f}, F1={val_metrics['f1']:.4f}, AUC={val_metrics['roc_auc']:.4f}")
-
-    if val_metrics["f1"] > best_f1:
-        best_f1 = val_metrics["f1"]
-        torch.save({"model_state": model.state_dict(), "classes": classes}, best_path)
-        epochs_no_improve = 0
-    else:
-        epochs_no_improve += 1
-        if epochs_no_improve >= patience:
-            print("⚠️ Early stopping triggered.")
+        if patience_counter > PATIENCE:
             break
 
-# ---------------- SAVE HISTORY ----------------
-with open(os.path.join(out_dir, "history.json"), "w") as f:
-    json.dump(history, f)
-
-# ---------------- TEST ----------------
-ckpt = torch.load(best_path, map_location=device)
-model.load_state_dict(ckpt["model_state"])
-test_loss, test_metrics = evaluate(model, test_loader, device, criterion)
-print("\n✅ Training complete!")
-print("📊 Test Metrics:", test_metrics)
-
-# ---------------- PLOT ----------------
-plt.figure()
-plt.plot(history["train_loss"], label="train_loss")
-plt.plot(history["val_loss"], label="val_loss")
-plt.legend(); plt.title("Loss Curves")
-plt.show()
+if __name__ == "__main__":
+    train_system()
